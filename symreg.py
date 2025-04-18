@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Callable
 import numpy as np
 import operator
@@ -49,6 +50,21 @@ class Node:
             return str(self.value)
         return f"{self.value}(" + ", ".join(map(str, self.children)) + ")"
 
+    def polish(self, ops):
+        operations = {}
+        alphabet = 'ABCDEFGHIJKLMOQRSTUVWYZ'
+
+        for k in ops:
+            operations[k] = alphabet[len(operations)]
+
+        if self.is_leaf():
+            if self.value.startswith('p'):
+                return 'P'
+            else:
+                return 'X'
+        return f"{operations[self.value]}" + ",".join(
+            map(partial(Node.polish, ops=ops), self.children))
+
     def copy(self):
         return deepcopy(self)
 
@@ -73,8 +89,6 @@ class Composition:
 
     def copy(self):
         return deepcopy(self)
-
-
 
 
 def evaluate_tree(node, variables: dict[str, np.ndarray],
@@ -251,8 +265,7 @@ class SymReg:
 
         # NOTE: multiprocessing doesn't work with lambdas, so we create functions explicitly
         def individual_constructor():
-            return creator.Individual(
-                *self.generate_composition(min(max_depth, 3)))
+            return creator.Individual(*self.generate_composition(max_depth))
 
         toolbox.register("individual", individual_constructor)
 
@@ -318,7 +331,7 @@ class SymReg:
                 self.pool[node_to_replace.value] = init_param()
             else:
                 current_depth = get_node_depth(node_to_replace)
-                
+
                 if current_depth == 0:
                     allowed_depths = [current_depth, current_depth + 1]
                 else:
