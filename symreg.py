@@ -1,13 +1,14 @@
 from typing import Callable
 import numpy as np
 import operator
-import math
 import random
 from copy import deepcopy
+from multiprocessing import Pool
+import os
+import time
+
 from deap import base, creator, tools
 from deap import tools
-
-import deap
 from deap import algorithms
 
 
@@ -56,6 +57,10 @@ class Composition:
         return deepcopy(self)
 
 
+def safe_log(x):
+    return np.log(abs(x) + 1e-5)
+
+
 # default operations with argument number
 DEFAULT_OPERATIONS = {
     'add': (operator.add, 2),
@@ -65,7 +70,7 @@ DEFAULT_OPERATIONS = {
     'sin': (np.sin, 1),
     'cos': (np.cos, 1),
     'exp': (np.exp, 1),
-    'log': (lambda x: np.log(abs(x) + 1e-5), 1),
+    'log': (lambda x: safe_log, 1),
     'max': (np.maximum, 2)
 }
 
@@ -155,24 +160,41 @@ def get_node_depth(node):
     return d
 
 
+def eval_worker(x):
+    loss_fn, x, y, pool, ops, weight_len, ind = x
+    return eval_individual(loss_fn, x, y, pool, ops, ind, weight_len)
+
+
+def eval_individual(loss_fn, x, y, pool, ops, ind, weight_num):
+    try:
+        variables = {f'x{i}': x[:, i] for i in range(x.shape[1])}
+        result = loss_fn(x, y, ind, variables, pool, ops)
+        return result
+
+    except Exception as e:
+        print(f'error: {e}')
+        return tuple([float('inf')] * weight_num)
+
+
 class SymReg:
 
     def __init__(
-        self,
-        loss_fn: Callable,
-        x: np.ndarray,
-        y: np.ndarray,
-        loss_component_num: int,
-        h_hidden_num: int,
-        g_head_num: int,
-        param_num: int,
-        init_population=50,
-        p_mutation=1.0,
-        loss_weights: tuple[float] = (-1.0, ),
-        operations: dict[str, Callable] = None,
-        elite_part=0.1,
-        mutate_params: bool = True,
-        weight_err_eps=1e-10,
+            self,
+            loss_fn: Callable,
+            x: np.ndarray,
+            y: np.ndarray,
+            loss_component_num: int,
+            h_hidden_num: int,
+            g_head_num: int,
+            param_num: int,
+            init_population=50,
+            proc_num: int = -1,
+            p_mutation=1.0,
+            operations: dict[str, Callable] = None,
+            elite_part=0.1,
+            mutate_params: bool = True,
+            loss_weights: tuple[float] = (-1.0, ),
+            weight_err_eps=1e-10,
     ):
         """ 
         A symbolic regression class
@@ -186,11 +208,12 @@ class SymReg:
             g_head_num (int): number of heads, "g" functions in compositions
             param_num (int): number of parameters to use
             init_population (int, optional): generation size. Defaults to 50.
+            proc_num (int, optional): number of processes to evaluate. If "-1" will use all cores. If "0", will use single core mode.
             p_mutation (float, optional): probability of mutation. Defaults to 1.0.
-            loss_weights (tuple, optional): initial weihght in loss. For minimization set negative. Defaults to (-1.0, ).
             operations (dict[str, Callable], optional): operations to use. If None, will use default. Defaults to None.
             elite_part (float, optional): percentage of population that will be greedily taken from top. Defaults to 0.1.
             mutate_params (bool, optional): if set, will also change values of parameters. Defaults to True.
+            loss_weights (tuple, optional): initial weihght in loss. For minimization set negative. Defaults to (-1.0, ).
             weight_err_eps (float, optional): near-zero value. Required for logging mainly. Defaults to 1e-10.
         """
         self.loss_fn = loss_fn
@@ -205,7 +228,7 @@ class SymReg:
         self.elite_part = elite_part
         self.mutate_params = mutate_params
         self.weight_err_erps = weight_err_eps
-       
+        self.proc_num = proc_num
         self.x = x
         self.y = y
 
@@ -220,17 +243,25 @@ class SymReg:
         creator.create("Individual", Composition, fitness=creator.FitnessMin)
 
         toolbox = base.Toolbox()
-        toolbox.register(
-            "individual",
-            lambda: creator.Individual(*self.generate_composition(3)))
+
+        # NOTE: multiprocessing doesn't work with lambdas, so we create functions explicitly
+        def individual_constructor():
+            return creator.Individual(*self.generate_composition(3))
+
+        toolbox.register("individual", individual_constructor)
+
         toolbox.register("population", tools.initRepeat, list,
                          toolbox.individual)
 
-        toolbox.register("evaluate", self.eval_individual)
+        toolbox.register(
+            "evaluate", lambda ind: eval_individual(
+                self.loss_fn, self.x, self.y, self.pool, self.operations, ind,
+                len(self.loss_weights)))
         toolbox.register("mutate", self.mutate)
         toolbox.register("select", tools.selTournament, tournsize=3)
-        toolbox.register("mate", lambda a, b:
-                         (a.copy(), b.copy()))  # пока без кроссовера
+
+        #toolbox.register("mate", lambda a, b:
+        #                 (a.copy(), b.copy()))  #
         self.toolbox = toolbox
         self.pop = toolbox.population(n=self.init_population)
 
@@ -285,26 +316,32 @@ class SymReg:
 
         return ind_copy,
 
-    def eval_individual(self, ind):
-        try:
-            variables = {f'x{i}': self.x[:, i] for i in range(self.x.shape[1])}
-            result = self.loss_fn(self.x, self.y, ind, variables, self.pool,
-                                  self.operations)
-            return result
-
-        except Exception as e:
-            print(f'error: {e}')
-            return tuple([float('inf')] * len(self.weights))
-
     def fit_epoch(self):
         offspring = algorithms.varAnd(self.pop,
                                       self.toolbox,
                                       cxpb=0.0,
                                       mutpb=self.p_mutation)
+        try:
+            offsping_to_eval = [(self.loss_fn, self.x, self.y, self.pool,
+                                 self.operations, len(self.loss_weights), g)
+                                for g in offspring]
+            core_num = self.proc_num
+            if core_num == -1:
+                core_num = os.cpu_count()
+            if core_num > 0:
+                pool = Pool(core_num)
+                map_func = pool.map
+            else:
+                pool = None
+                map_func = map
+            for ind, eval_result in zip(
+                    offspring, map_func(eval_worker, offsping_to_eval)):
+                ind.fitness.values = eval_result
 
-        for ind in offspring:
-            ind.fitness.values = self.toolbox.evaluate(ind)
-
+        finally:
+            if pool is not None:
+                pool.close()
+            pool = None
         elite_size = int(len(self.pop) * self.elite_part)
         elite = tools.selBest(self.pop, k=elite_size)
         self.pop = self.toolbox.select(
@@ -315,7 +352,9 @@ class SymReg:
     def fit(self,
             epoch_num,
             log_models_every: int = -1,
-            log_perf_every: int = -1):
+            log_perf_every: int = -1,
+            log_time_every: int = -1):
+        time_s = time.time()
         for e in range(epoch_num):
             self.fit_epoch()
             best = tools.selBest(self.pop, 1)[0]
@@ -324,5 +363,7 @@ class SymReg:
                 print(f"[Gen {e}] Expr: {best}")
             if log_perf_every > 0 and e % log_perf_every == 0:
                 print(f"[Gen {e}] Best errors: {err}")
+            if log_time_every > 0 and e % log_time_every == 0:
+                print(f"[Gen {e}] Total time: {time.time() - time_s}")
         best = tools.selBest(self.pop, 1)[0]
         return best
