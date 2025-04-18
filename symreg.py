@@ -12,6 +12,24 @@ from deap import tools
 from deap import algorithms
 
 
+def safe_log(x):
+    return np.log(abs(x) + 1e-5)
+
+
+# default operations with argument number
+DEFAULT_OPERATIONS = {
+    'add': (operator.add, 2),
+    'sub': (operator.sub, 2),
+    'mult': (operator.mul, 2),
+    #'/': (lambda x, y: x / y, 2),
+    'sin': (np.sin, 1),
+    'cos': (np.cos, 1),
+    'exp': (np.exp, 1),
+    'log': (safe_log, 1),
+    'max': (np.maximum, 2)
+}
+
+
 class Node:
     """
     This class represents a node in an expression tree
@@ -57,22 +75,6 @@ class Composition:
         return deepcopy(self)
 
 
-def safe_log(x):
-    return np.log(abs(x) + 1e-5)
-
-
-# default operations with argument number
-DEFAULT_OPERATIONS = {
-    'add': (operator.add, 2),
-    'sub': (operator.sub, 2),
-    'mult': (operator.mul, 2),
-    #'/': (lambda x, y: x / y, 2),
-    'sin': (np.sin, 1),
-    'cos': (np.cos, 1),
-    'exp': (np.exp, 1),
-    'log': (lambda x: safe_log, 1),
-    'max': (np.maximum, 2)
-}
 
 
 def evaluate_tree(node, variables: dict[str, np.ndarray],
@@ -150,7 +152,7 @@ def get_node_depth(node):
     """
     Depth of the node
     """
-    d = 1
+    d = 0
     buf = []
     buf.extend([(1, n) for n in node.children])
     while len(buf) > 0:
@@ -179,22 +181,23 @@ def eval_individual(loss_fn, x, y, pool, ops, ind, weight_num):
 class SymReg:
 
     def __init__(
-            self,
-            loss_fn: Callable,
-            x: np.ndarray,
-            y: np.ndarray,
-            loss_component_num: int,
-            h_hidden_num: int,
-            g_head_num: int,
-            param_num: int,
-            init_population=50,
-            proc_num: int = -1,
-            p_mutation=1.0,
-            operations: dict[str, Callable] = None,
-            elite_part=0.1,
-            mutate_params: bool = True,
-            loss_weights: tuple[float] = (-1.0, ),
-            weight_err_eps=1e-10,
+        self,
+        loss_fn: Callable,
+        x: np.ndarray,
+        y: np.ndarray,
+        loss_component_num: int,
+        h_hidden_num: int,
+        g_head_num: int,
+        param_num: int,
+        init_population=50,
+        proc_num: int = -1,
+        p_mutation=1.0,
+        operations: dict[str, Callable] = None,
+        elite_part=0.1,
+        mutate_params: bool = True,
+        loss_weights: tuple[float] = (-1.0, ),
+        weight_err_eps=1e-10,
+        max_depth: int = 10,
     ):
         """ 
         A symbolic regression class
@@ -215,6 +218,7 @@ class SymReg:
             mutate_params (bool, optional): if set, will also change values of parameters. Defaults to True.
             loss_weights (tuple, optional): initial weihght in loss. For minimization set negative. Defaults to (-1.0, ).
             weight_err_eps (float, optional): near-zero value. Required for logging mainly. Defaults to 1e-10.
+            max_depth (int): max depth
         """
         self.loss_fn = loss_fn
         self.loss_component_num = loss_component_num
@@ -231,6 +235,7 @@ class SymReg:
         self.proc_num = proc_num
         self.x = x
         self.y = y
+        self.max_depth = max_depth
 
         self.pool = {f'p{i}': init_param() for i in range(self.param_num)}
         self.variables = [f'x{i}' for i in range(self.x.shape[1])]
@@ -246,7 +251,8 @@ class SymReg:
 
         # NOTE: multiprocessing doesn't work with lambdas, so we create functions explicitly
         def individual_constructor():
-            return creator.Individual(*self.generate_composition(3))
+            return creator.Individual(
+                *self.generate_composition(min(max_depth, 3)))
 
         toolbox.register("individual", individual_constructor)
 
@@ -277,8 +283,10 @@ class SymReg:
         ]
         return h, g
 
-    def generate_random_tree(self, max_depth, variables):
-        if max_depth == 0 or (max_depth > 1 and random.random() < 0.3):
+    def generate_random_tree(self, max_depth, variables, strict=False):
+        # strict here stands for direct control of the depth
+        if max_depth == 0 or (not strict and max_depth >= 1
+                              and random.random() < 0.3):
             if random.random() < 0.5:
                 return Node(random.choice(variables))
             else:
@@ -309,8 +317,23 @@ class SymReg:
                     'p') and random.uniform(0, 1) < 0.5 and self.mutate_params:
                 self.pool[node_to_replace.value] = init_param()
             else:
-
-                new_subtree = self.generate_random_tree(3, variables)
+                current_depth = get_node_depth(node_to_replace)
+                
+                if current_depth == 0:
+                    allowed_depths = [current_depth, current_depth + 1]
+                else:
+                    allowed_depths = [
+                        current_depth - 1, current_depth, current_depth + 1
+                    ]
+                if current_depth >= self.max_depth:
+                    allowed_depths = allowed_depths[:-1]
+                if len(allowed_depths) == 1:
+                    new_depth = allowed_depths[0]
+                else:
+                    new_depth = random.choice(allowed_depths)
+                new_subtree = self.generate_random_tree(new_depth,
+                                                        variables,
+                                                        strict=True)
                 node_to_replace.value = new_subtree.value
                 node_to_replace.children = new_subtree.children
 
