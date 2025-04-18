@@ -286,12 +286,12 @@ class SymReg:
 
     def generate_composition(self, max_depth):
         h = [
-            self.generate_random_tree(max_depth, self.variables)
+            self.generate_random_tree(random.randint(0, max_depth), self.variables, True)
             for _ in range(self.h_hidden_num)
         ]
 
         g = [
-            self.generate_random_tree(max_depth, self.hidden_variables)
+            self.generate_random_tree(random.randint(0, max_depth), self.hidden_variables, True)
             for _ in range(self.g_head_num)
         ]
         return h, g
