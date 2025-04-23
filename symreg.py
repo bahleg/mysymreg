@@ -39,7 +39,7 @@ class Node:
     """
 
     def __init__(self, value, children=None):
-        self.value = value
+        self.value = value # value is X* or P* 
         self.children = children or []
 
     def is_leaf(self):
